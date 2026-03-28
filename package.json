@@ -1,0 +1,9 @@
+{
+  "name": "openclaw-plugins",
+  "private": true,
+  "description": "OpenClaw plugins: pipeline orchestrator, memory-lancedb, google-antigravity-auth",
+  "type": "module",
+  "workspaces": [
+    "plugins/*"
+  ]
+}
