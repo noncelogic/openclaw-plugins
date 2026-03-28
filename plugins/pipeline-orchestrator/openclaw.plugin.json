@@ -5,34 +5,45 @@
     "additionalProperties": false,
     "properties": {
       "repo": {
-        "type": "string",
-        "description": "GitHub repo (owner/name)"
+        "type": "string"
       },
       "projectPath": {
-        "type": "string",
-        "description": "Local path to the project"
+        "type": "string"
+      },
+      "statePath": {
+        "type": "string"
       },
       "intervalSec": {
-        "type": "number",
-        "description": "Orchestration interval in seconds"
+        "type": "number"
       },
       "maxWip": {
-        "type": "number",
-        "description": "Maximum work-in-progress issues"
+        "type": "number"
       },
       "defaultWorker": {
-        "type": "string",
-        "enum": ["claude", "codex"],
-        "description": "Default worker for issue implementation"
+        "type": "string"
       },
       "cooldownMinutes": {
-        "type": "number",
-        "description": "Cooldown between worker invocations"
+        "type": "number"
       },
       "notifyEnabled": {
         "type": "boolean"
+      },
+      "notifyChannel": {
+        "type": "string"
+      },
+      "notifyTarget": {
+        "type": "string"
+      },
+      "selfHealDirtyWorktree": {
+        "type": "boolean"
+      },
+      "telegramBotToken": {
+        "type": "string"
       }
     },
-    "required": ["repo", "projectPath"]
+    "required": [
+      "repo",
+      "projectPath"
+    ]
   }
 }

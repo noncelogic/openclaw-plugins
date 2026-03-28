@@ -1,5 +1,5 @@
 {
-  "name": "@noncelogic/openclaw-pipeline-orchestrator",
+  "name": "pipeline-orchestrator",
   "version": "0.1.0",
   "description": "OpenClaw pipeline orchestrator plugin - manages GitHub issues, PRs, and CI in-process",
   "type": "module",
