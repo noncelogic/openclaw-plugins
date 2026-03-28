@@ -2,24 +2,68 @@
  * OpenClaw Pipeline Orchestrator Plugin
  *
  * In-process pipeline management for GitHub issues, PRs, and CI.
- * Replaces the external systemd timer-based orchestrator.
+ * Wraps the existing pipeline-orchestrator.mjs scripts and adds:
+ * - Session-aware notifications via before_agent_start hook
+ * - Pipeline tools (status, pause, resume) accessible to the agent
+ * - CLI commands for manual pipeline management
  *
- * Key advantages over the systemd approach:
- * - Notifications appear in active session context
- * - No orphaned worker processes
- * - Direct access to the agent runtime for task dispatch
- * - Single process, better memory management
+ * The orchestration logic lives in scripts/pipeline-orchestrator.mjs
+ * and is invoked via scripts/run.mjs (same as the systemd timer).
  */
 
+import { spawn } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "@sinclair/typebox";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SCRIPTS_DIR = join(__dirname, "scripts");
 
 // ============================================================================
 // Registration Guard
 // ============================================================================
 
 let _registered = false;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+async function runScript(
+  scriptArgs: string[],
+  env: Record<string, string> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, scriptArgs, {
+      cwd: SCRIPTS_DIR,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+    child.on("error", (err) =>
+      resolve({ code: 1, stdout, stderr: `${stderr}\n${err.message}`.trim() }),
+    );
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+  });
+}
+
+async function readStateJson(statePath: string): Promise<Record<string, unknown>> {
+  try {
+    return JSON.parse(await readFile(statePath, "utf-8"));
+  } catch {
+    return {};
+  }
+}
 
 // ============================================================================
 // Plugin Definition
@@ -36,11 +80,16 @@ export default definePluginEntry({
     properties: {
       repo: { type: "string" },
       projectPath: { type: "string" },
+      statePath: { type: "string" },
       intervalSec: { type: "number" },
       maxWip: { type: "number" },
       defaultWorker: { type: "string" },
       cooldownMinutes: { type: "number" },
       notifyEnabled: { type: "boolean" },
+      notifyChannel: { type: "string" },
+      notifyTarget: { type: "string" },
+      selfHealDirtyWorktree: { type: "boolean" },
+      telegramBotToken: { type: "string" },
     },
     required: ["repo", "projectPath"] as const,
   },
@@ -52,50 +101,119 @@ export default definePluginEntry({
     }
     _registered = true;
 
-    const cfg = api.pluginConfig as {
-      repo?: string;
-      projectPath?: string;
-      intervalSec?: number;
-      maxWip?: number;
-      defaultWorker?: string;
-      cooldownMinutes?: number;
-      notifyEnabled?: boolean;
-    };
+    const cfg = api.pluginConfig as Record<string, unknown>;
 
-    const REPO = cfg.repo || "noncelogic/signalflow";
-    const PROJECT_PATH = cfg.projectPath || "";
-    const INTERVAL = (cfg.intervalSec || 30) * 1000;
-    const MAX_WIP = cfg.maxWip || 1;
+    const REPO = String(cfg.repo || "noncelogic/signalflow");
+    const PROJECT_PATH = String(cfg.projectPath || "");
+    const STATE_PATH = String(
+      cfg.statePath ||
+        join(
+          process.env.HOME || "",
+          ".openclaw",
+          "workspace",
+          "memory",
+          "pipeline-state.json",
+        ),
+    );
+    const INTERVAL = (Number(cfg.intervalSec) || 30) * 1000;
     const NOTIFY = cfg.notifyEnabled !== false;
 
+    // Build env for scripts
+    const scriptEnv: Record<string, string> = {
+      PIPELINE_REPO: REPO,
+      PIPELINE_PROJECT_PATH: PROJECT_PATH,
+      PIPELINE_STATE_PATH: STATE_PATH,
+      PIPELINE_MAX_WIP: String(cfg.maxWip || 1),
+      PIPELINE_CLAUDE_COOLDOWN_MINUTES: String(cfg.cooldownMinutes || 120),
+      PIPELINE_DEFAULT_WORKER: String(cfg.defaultWorker || "claude"),
+      PIPELINE_SELF_HEAL_DIRTY_WORKTREE: String(
+        cfg.selfHealDirtyWorktree !== false,
+      ),
+      PIPELINE_NOTIFY_ENABLED: String(NOTIFY),
+      PIPELINE_NOTIFY_CHANNEL: String(cfg.notifyChannel || "telegram"),
+      PIPELINE_NOTIFY_TARGET: String(cfg.notifyTarget || ""),
+      PIPELINE_STRICT_START: "true",
+    };
+    if (cfg.telegramBotToken) {
+      scriptEnv.PIPELINE_TELEGRAM_BOT_TOKEN = String(cfg.telegramBotToken);
+    }
+
     let orchestrateTimer: ReturnType<typeof setInterval> | null = null;
+    let orchestrating = false;
 
     api.logger.info(
       `pipeline-orchestrator: registered (repo=${REPO}, interval=${INTERVAL / 1000}s)`,
     );
 
     // ========================================================================
-    // Session-aware notifications via before_agent_start hook
+    // Session-aware notifications
     // ========================================================================
 
     const pendingNotifications: string[] = [];
 
-    if (NOTIFY) {
-      api.on("before_agent_start", async (_event) => {
-        if (pendingNotifications.length === 0) return;
-        const context = pendingNotifications.splice(0).join("\n\n");
-        api.logger.info(
-          `pipeline-orchestrator: injecting notifications into context`,
-        );
-        return {
-          prependContext: `<pipeline-notifications>\n${context}\n</pipeline-notifications>`,
-        };
-      });
-    }
+    api.on("before_agent_start", async (_event) => {
+      // Always inject pipeline state summary on agent start
+      const state = await readStateJson(STATE_PATH);
+      const status = state.status || "unknown";
+      const currentJob = state.currentJob || "none";
+      const queueLen = Array.isArray(state.queue) ? state.queue.length : 0;
+
+      const parts: string[] = [];
+      parts.push(
+        `Pipeline: ${status} | current: ${currentJob} | queued: ${queueLen} | repo: ${REPO}`,
+      );
+
+      if (pendingNotifications.length > 0) {
+        parts.push("Recent events:");
+        parts.push(...pendingNotifications.splice(0));
+      }
+
+      return {
+        prependContext: `<pipeline-context>\n${parts.join("\n")}\n</pipeline-context>`,
+      };
+    });
 
     function queueNotification(message: string) {
       pendingNotifications.push(`[${new Date().toISOString()}] ${message}`);
-      while (pendingNotifications.length > 10) pendingNotifications.shift();
+      while (pendingNotifications.length > 20) pendingNotifications.shift();
+    }
+
+    // ========================================================================
+    // Orchestration loop
+    // ========================================================================
+
+    async function orchestrate() {
+      if (orchestrating) return;
+      orchestrating = true;
+      try {
+        const result = await runScript(
+          [join(SCRIPTS_DIR, "run.mjs"), "orchestrate"],
+          scriptEnv,
+        );
+        if (result.code !== 0) {
+          api.logger.warn(
+            `pipeline-orchestrator: cycle failed (code=${result.code}): ${result.stderr.slice(0, 200)}`,
+          );
+        } else {
+          // Parse transitions from stdout for notifications
+          try {
+            const out = JSON.parse(result.stdout);
+            if (Array.isArray(out.transitions) && out.transitions.length > 0) {
+              for (const t of out.transitions) {
+                queueNotification(String(t));
+              }
+            }
+          } catch {
+            // stdout may not be JSON if the script logged other things
+          }
+        }
+      } catch (err) {
+        api.logger.warn(
+          `pipeline-orchestrator: cycle error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        orchestrating = false;
+      }
     }
 
     // ========================================================================
@@ -110,14 +228,20 @@ export default definePluginEntry({
           "Show current pipeline orchestrator status: running jobs, queued issues, open PRs, and recent transitions.",
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
-          // TODO: Port from pipeline-orchestrator.mjs orchestrate() status logic
+          const state = await readStateJson(STATE_PATH);
+          const summary = [
+            `Status: ${state.status || "unknown"}`,
+            `Current job: ${state.currentJob || "none"}`,
+            `Current worker: ${state.currentWorker || "none"}`,
+            `Queue: ${Array.isArray(state.queue) ? state.queue.join(", ") : "empty"}`,
+            `Auto-pickup: ${state.autoPickup !== false}`,
+            `Last orchestrated: ${state.lastOrchestratedAt || "never"}`,
+            `Last completed: ${JSON.stringify(state.lastCompleted || null)}`,
+            `Last error: ${state.lastError || "none"}`,
+            `Pending notifications: ${pendingNotifications.length}`,
+          ];
           return {
-            content: [
-              {
-                type: "text",
-                text: `Pipeline orchestrator active.\nRepo: ${REPO}\nProject: ${PROJECT_PATH}\nMax WIP: ${MAX_WIP}\nPending notifications: ${pendingNotifications.length}`,
-              },
-            ],
+            content: [{ type: "text", text: summary.join("\n") }],
           };
         },
       },
@@ -137,6 +261,11 @@ export default definePluginEntry({
         }),
         async execute(_toolCallId, params) {
           const { reason } = params as { reason?: string };
+          const state = await readStateJson(STATE_PATH);
+          state.autoPickup = false;
+          state.status = "paused";
+          if (reason) state.pauseReason = reason;
+          await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
           queueNotification(
             `Pipeline paused${reason ? `: ${reason}` : ""}`,
           );
@@ -157,10 +286,14 @@ export default definePluginEntry({
       {
         name: "pipeline_resume",
         label: "Pipeline Resume",
-        description:
-          "Resume the pipeline orchestrator after a pause.",
+        description: "Resume the pipeline orchestrator after a pause.",
         parameters: Type.Object({}),
         async execute(_toolCallId, _params) {
+          const state = await readStateJson(STATE_PATH);
+          state.autoPickup = true;
+          state.status = "idle";
+          delete state.pauseReason;
+          await writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
           queueNotification("Pipeline resumed");
           return {
             content: [{ type: "text", text: "Pipeline resumed." }],
@@ -172,22 +305,34 @@ export default definePluginEntry({
 
     api.registerTool(
       {
-        name: "pipeline_notify",
-        label: "Pipeline Notify",
+        name: "pipeline_run_reconcile",
+        label: "Pipeline Reconcile",
         description:
-          "Queue a notification for the pipeline context. Used by external systems to inject status updates.",
+          "Run a pipeline reconciliation cycle: check PR states, merge ready PRs, update queue.",
         parameters: Type.Object({
-          message: Type.String({ description: "Notification message" }),
+          dryRun: Type.Optional(
+            Type.Boolean({ description: "Preview without making changes" }),
+          ),
         }),
         async execute(_toolCallId, params) {
-          const { message } = params as { message: string };
-          queueNotification(message);
+          const { dryRun } = params as { dryRun?: boolean };
+          const args = [join(SCRIPTS_DIR, "run.mjs"), "reconcile"];
+          if (dryRun) args.push("--dry-run");
+          const result = await runScript(args, scriptEnv);
           return {
-            content: [{ type: "text", text: `Notification queued: ${message}` }],
+            content: [
+              {
+                type: "text",
+                text:
+                  result.code === 0
+                    ? result.stdout
+                    : `Reconcile failed (code=${result.code}): ${result.stderr.slice(0, 500)}`,
+              },
+            ],
           };
         },
       },
-      { name: "pipeline_notify" },
+      { name: "pipeline_run_reconcile" },
     );
 
     // ========================================================================
@@ -204,32 +349,65 @@ export default definePluginEntry({
           .command("status")
           .description("Show pipeline status")
           .action(async () => {
-            console.log("Pipeline orchestrator plugin active");
-            console.log(`Repo: ${REPO}`);
-            console.log(`Project: ${PROJECT_PATH}`);
-            console.log(`Interval: ${INTERVAL / 1000}s`);
-            console.log(`Max WIP: ${MAX_WIP}`);
-            console.log(
-              `Pending notifications: ${pendingNotifications.length}`,
-            );
+            const state = await readStateJson(STATE_PATH);
+            console.log(JSON.stringify(state, null, 2));
           });
 
         pipeline
-          .command("notify")
-          .description(
-            "Queue a notification for the next agent interaction",
-          )
-          .argument("<message>", "Notification message")
-          .action(async (message: string) => {
-            queueNotification(message);
-            console.log(`Queued: ${message}`);
+          .command("orchestrate")
+          .description("Run one orchestration cycle")
+          .action(async () => {
+            await orchestrate();
+            console.log("Orchestration cycle complete");
+          });
+
+        pipeline
+          .command("reconcile")
+          .description("Run reconciliation")
+          .option("--dry-run", "Preview without making changes")
+          .action(async (opts) => {
+            const args = [join(SCRIPTS_DIR, "run.mjs"), "reconcile"];
+            if (opts.dryRun) args.push("--dry-run");
+            const result = await runScript(args, scriptEnv);
+            console.log(result.stdout || result.stderr);
+          });
+
+        pipeline
+          .command("pause")
+          .description("Pause the pipeline")
+          .argument("[reason]", "Reason for pausing")
+          .action(async (reason) => {
+            const state = await readStateJson(STATE_PATH);
+            state.autoPickup = false;
+            state.status = "paused";
+            if (reason) state.pauseReason = reason;
+            await writeFile(
+              STATE_PATH,
+              JSON.stringify(state, null, 2) + "\n",
+            );
+            console.log("Pipeline paused");
+          });
+
+        pipeline
+          .command("resume")
+          .description("Resume the pipeline")
+          .action(async () => {
+            const state = await readStateJson(STATE_PATH);
+            state.autoPickup = true;
+            state.status = "idle";
+            delete state.pauseReason;
+            await writeFile(
+              STATE_PATH,
+              JSON.stringify(state, null, 2) + "\n",
+            );
+            console.log("Pipeline resumed");
           });
       },
       { commands: ["pipeline"] },
     );
 
     // ========================================================================
-    // Service (orchestration loop)
+    // Service
     // ========================================================================
 
     api.registerService({
@@ -238,16 +416,10 @@ export default definePluginEntry({
         api.logger.info(
           `pipeline-orchestrator: started (interval=${INTERVAL / 1000}s, repo=${REPO})`,
         );
-        // TODO: Port the full orchestrate() loop from pipeline-orchestrator.mjs
-        // The orchestration cycle should:
-        // 1. Fetch open issues from GitHub (prioritized, sized)
-        // 2. Check open PRs and merge ready ones
-        // 3. Dispatch workers for queued issues
-        // 4. Monitor running workers and collect results
-        // 5. Queue notifications for transitions
-        orchestrateTimer = setInterval(() => {
-          // TODO: orchestrate() cycle
-        }, INTERVAL);
+        // Run first cycle after a short delay
+        setTimeout(() => orchestrate(), 5000);
+        // Then run on interval
+        orchestrateTimer = setInterval(() => orchestrate(), INTERVAL);
       },
       stop: () => {
         if (orchestrateTimer) {
