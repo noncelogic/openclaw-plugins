@@ -15,8 +15,7 @@ import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -26,7 +25,10 @@ const SCRIPTS_DIR = join(__dirname, "scripts");
 // Registration Guard
 // ============================================================================
 
-let _registered = false;
+// File-based singleton guard
+import { existsSync as _plExists, writeFileSync as _plWrite, unlinkSync as _plUnlink } from "node:fs";
+const _plGuardPath = `/tmp/openclaw-pl-${process.pid}.lock`;
+process.once("exit", () => { try { _plUnlink(_plGuardPath); } catch {} });
 
 // ============================================================================
 // Helpers
@@ -69,7 +71,7 @@ async function readStateJson(statePath: string): Promise<Record<string, unknown>
 // Plugin Definition
 // ============================================================================
 
-export default definePluginEntry({
+const pipelinePlugin = {
   id: "pipeline-orchestrator",
   name: "Pipeline Orchestrator",
   description:
@@ -95,11 +97,11 @@ export default definePluginEntry({
   },
 
   register(api: OpenClawPluginApi) {
-    if (_registered) {
-      api.logger.info("pipeline-orchestrator: skipping duplicate registration");
+    if (_plExists(_plGuardPath)) {
+      api.logger.info("pipeline-orchestrator: skipping duplicate registration (pid-lock)");
       return;
     }
-    _registered = true;
+    try { _plWrite(_plGuardPath, String(Date.now())); } catch {}
 
     const cfg = api.pluginConfig as Record<string, unknown>;
 
@@ -125,7 +127,7 @@ export default definePluginEntry({
       PIPELINE_STATE_PATH: STATE_PATH,
       PIPELINE_MAX_WIP: String(cfg.maxWip || 1),
       PIPELINE_CLAUDE_COOLDOWN_MINUTES: String(cfg.cooldownMinutes || 120),
-      PIPELINE_DEFAULT_WORKER: String(cfg.defaultWorker || "claude"),
+      PIPELINE_DEFAULT_WORKER: String(cfg.defaultWorker || "codex"),
       PIPELINE_SELF_HEAL_DIRTY_WORKTREE: String(
         cfg.selfHealDirtyWorktree !== false,
       ),
@@ -152,24 +154,50 @@ export default definePluginEntry({
     const pendingNotifications: string[] = [];
 
     api.on("before_agent_start", async (_event) => {
-      // Always inject pipeline state summary on agent start
+      // Inject rich pipeline state so the agent can reason about pipeline progress
       const state = await readStateJson(STATE_PATH);
-      const status = state.status || "unknown";
-      const currentJob = state.currentJob || "none";
-      const queueLen = Array.isArray(state.queue) ? state.queue.length : 0;
+      const status = String(state.status || "unknown");
+      const currentJob = state.currentJob || null;
+      const queue = Array.isArray(state.queue) ? state.queue : [];
 
-      const parts: string[] = [];
-      parts.push(
-        `Pipeline: ${status} | current: ${currentJob} | queued: ${queueLen} | repo: ${REPO}`,
-      );
+      const lines: string[] = [];
+      lines.push(`Pipeline (${REPO})`);
+      lines.push(`Status: ${status}`);
 
+      // Active job details
+      if (currentJob) {
+        const issue = state.currentIssue || "?";
+        const worker = state.currentWorker || "unknown";
+        const startedAt = state.currentJobStartedAt || state.startedAt || "?";
+        lines.push(`Active job: ${currentJob} (issue #${issue}, worker: ${worker}, started: ${startedAt})`);
+      }
+
+      // Queue
+      if (queue.length > 0) {
+        lines.push(`Queue: ${queue.map((n: unknown) => `#${n}`).join(", ")} (${queue.length} pending)`);
+      } else {
+        lines.push("Queue: empty");
+      }
+
+      // Last completed job
+      const lc = state.lastCompleted as Record<string, unknown> | undefined;
+      if (lc?.issue) {
+        lines.push(`Last completed: issue #${lc.issue} → PR #${lc.pr || "?"} (${lc.completedAt || "?"})`);
+      }
+
+      // Last error
+      if (state.lastError) {
+        lines.push(`Last error: ${String(state.lastError).slice(0, 200)}`);
+      }
+
+      // Recent significant events from orchestration cycles
       if (pendingNotifications.length > 0) {
-        parts.push("Recent events:");
-        parts.push(...pendingNotifications.splice(0));
+        lines.push("Recent events:");
+        lines.push(...pendingNotifications.splice(0));
       }
 
       return {
-        prependContext: `<pipeline-context>\n${parts.join("\n")}\n</pipeline-context>`,
+        prependContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
       };
     });
 
@@ -410,24 +438,13 @@ export default definePluginEntry({
     // Service
     // ========================================================================
 
-    api.registerService({
-      id: "pipeline-orchestrator",
-      start: () => {
-        api.logger.info(
-          `pipeline-orchestrator: started (interval=${INTERVAL / 1000}s, repo=${REPO})`,
-        );
-        // Run first cycle after a short delay
-        setTimeout(() => orchestrate(), 5000);
-        // Then run on interval
-        orchestrateTimer = setInterval(() => orchestrate(), INTERVAL);
-      },
-      stop: () => {
-        if (orchestrateTimer) {
-          clearInterval(orchestrateTimer);
-          orchestrateTimer = null;
-        }
-        api.logger.info("pipeline-orchestrator: stopped");
-      },
-    });
+    // Start orchestration loop directly (registerService.start doesn't fire on v2026.3.13)
+    api.logger.info(
+      `pipeline-orchestrator: starting loop (interval=${INTERVAL / 1000}s, repo=${REPO})`,
+    );
+    setTimeout(() => orchestrate(), 5000);
+    orchestrateTimer = setInterval(() => orchestrate(), INTERVAL);
   },
-});
+};
+
+export default pipelinePlugin;
