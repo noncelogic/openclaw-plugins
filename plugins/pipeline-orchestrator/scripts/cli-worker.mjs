@@ -37,6 +37,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isRateLimitText(text) {
+  const normalized = String(text || '').toLowerCase();
+  return (
+    normalized.includes('rate limit') ||
+    normalized.includes('rate-limited') ||
+    normalized.includes('429') ||
+    normalized.includes('quota') ||
+    normalized.includes('usage limit') ||
+    normalized.includes('too many requests') ||
+    normalized.includes('out of extra usage')
+  );
+}
+
 async function emitSystemEvent(text, attempts = 3) {
   const openclawBin = process.env.OPENCLAW_BINARY_PATH || 'openclaw';
 
@@ -122,26 +135,17 @@ async function run() {
   const meta = await readMeta();
   await log(`[worker] Starting CLI job ${jobId}\n`);
 
-  const worker = String(meta.worker || 'claude').toLowerCase();
+  const worker = String(meta.worker || 'codex').toLowerCase();
   let bin;
   let args;
   if (worker === 'codex') {
-    await acquireCodexLock();
-    codexLockHeld = true;
-    bin = process.env.CODEX_BINARY_PATH || 'codex';
+    bin = process.env.OPENCLAW_BINARY_PATH || 'openclaw';
     args = [
-      'exec',
-      '--full-auto',
-      '--ephemeral',
-      '--sandbox',
-      'danger-full-access',
-      '--cd',
-      meta.cwd,
+      'agent',
+      '--agent', 'pipeline-codex',
+      '--local',
+      '--message', meta.prompt,
     ];
-    if (meta.model) {
-      args.push('--model', meta.model);
-    }
-    args.push(meta.prompt);
   } else {
     bin = process.env.CLAUDE_BINARY_PATH || 'claude';
     args = [
@@ -215,13 +219,7 @@ async function run() {
       eventText = `JOB_DONE:${jobId}`;
     } else {
       const combined = outputBuffer.toLowerCase();
-      const rateLimited =
-        combined.includes('rate limit') ||
-        combined.includes('rate-limited') ||
-        combined.includes('429') ||
-        combined.includes('quota') ||
-        combined.includes('usage limit') ||
-        combined.includes('too many requests');
+      const rateLimited = isRateLimitText(combined);
       meta.status = 'failed';
       meta.error = `CLI exited with code ${code}`;
       meta.rateLimited = rateLimited;

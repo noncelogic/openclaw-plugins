@@ -19,7 +19,7 @@ const CODEX_MODEL = process.env.PIPELINE_CODEX_MODEL || 'gpt-5.3-codex';
 const COOLDOWN_MINUTES = Number(process.env.PIPELINE_CLAUDE_COOLDOWN_MINUTES || 120);
 const DEFAULT_WORKER = ['claude', 'codex'].includes(String(process.env.PIPELINE_DEFAULT_WORKER || '').toLowerCase())
   ? String(process.env.PIPELINE_DEFAULT_WORKER || '').toLowerCase()
-  : 'claude';
+  : 'codex';
 const SELF_HEAL_DIRTY_WORKTREE = String(process.env.PIPELINE_SELF_HEAL_DIRTY_WORKTREE || 'true').toLowerCase() === 'true';
 const NOTIFY_ENABLED = String(process.env.PIPELINE_NOTIFY_ENABLED || '').toLowerCase() === 'true';
 const NOTIFY_BIN = process.env.PIPELINE_NOTIFY_BIN || 'openclaw';
@@ -437,8 +437,42 @@ function buildTransitionMessage(next, out, prioritizedOpen, openPrs, nowIso) {
   ].join('\n');
 }
 
+function isRateLimitText(text) {
+  const normalized = String(text || '').toLowerCase();
+  return (
+    normalized.includes('rate limit') ||
+    normalized.includes('rate-limited') ||
+    normalized.includes('429') ||
+    normalized.includes('quota') ||
+    normalized.includes('usage limit') ||
+    normalized.includes('too many requests') ||
+    normalized.includes('out of extra usage')
+  );
+}
+
+// Transitions worth notifying about — actual state changes the user or agent should know about.
+// Everything else (self-heal, branch prep, heartbeats) is internal bookkeeping.
+const SIGNIFICANT_TRANSITION_PATTERNS = [
+  /-> running/,         // job started
+  /-> pr-pending/,      // job completed, waiting for PR merge
+  /-> idle/,            // job finished (completed, failed, or PR merged)
+  /-> blocked/,         // something broke
+  /-> paused/,          // pipeline paused
+  /paused ->/,          // pipeline resumed
+  /auto-merge enabled/, // PR auto-merge triggered
+  /direct-merged/,      // PR merged directly
+  /start failed/,       // job failed to start
+];
+
+function hasSignificantTransition(transitions) {
+  return transitions.some((t) =>
+    SIGNIFICANT_TRANSITION_PATTERNS.some((pattern) => pattern.test(t)),
+  );
+}
+
 async function maybeNotifyTransition(next, out, prioritizedOpen, openPrs, nowIso) {
   if (!NOTIFY_ENABLED || out.transitions.length === 0) return false;
+  if (!hasSignificantTransition(out.transitions)) return false;
   const paused = next.status === PIPELINE_STATUS.PAUSED || next.autoPickup === false;
   const pauseTransition = out.transitions.some(
     (t) => String(t).includes('-> paused') || String(t).includes('paused ->'),
@@ -895,12 +929,7 @@ async function run() {
           } catch (err) {
             const msg = String(err?.message || err);
             const startRateLimited =
-              msg.toLowerCase().includes('rate limit') ||
-              msg.toLowerCase().includes('rate-limited') ||
-              msg.toLowerCase().includes('429') ||
-              msg.toLowerCase().includes('quota') ||
-              msg.toLowerCase().includes('usage limit') ||
-              msg.toLowerCase().includes('too many requests');
+              isRateLimitText(msg);
             next.lastError = `start failed for ${jobId} (${worker}): ${msg}`;
             if (worker === 'claude' && startRateLimited) {
               next.claudeCooldownUntil = toIso(nowMs + COOLDOWN_MINUTES * 60 * 1000);
