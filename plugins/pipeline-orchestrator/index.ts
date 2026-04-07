@@ -97,26 +97,69 @@ const pipelinePlugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    // Always resolve config for hooks — hooks must register on every load
+    // because the gateway may only bind hooks from the final registration pass.
+    const cfg = api.pluginConfig as Record<string, unknown>;
+    const STATE_PATH_FOR_HOOK = String(
+      cfg.statePath ||
+        join(process.env.HOME || "", ".openclaw", "workspace", "memory", "pipeline-state.json"),
+    );
+    const REPO_FOR_HOOK = String(cfg.repo || "noncelogic/signalflow");
+    const pendingNotifications: string[] = [];
+
+    api.on("before_agent_start", async (_event) => {
+      // Inject rich pipeline state so the agent can reason about pipeline progress
+      const state = await readStateJson(STATE_PATH_FOR_HOOK);
+      api.logger.info?.(`pipeline-orchestrator: injecting pipeline context (status=${state.status || "unknown"})`);
+      const status = String(state.status || "unknown");
+      const currentJob = state.currentJob || null;
+      const queue = Array.isArray(state.queue) ? state.queue : [];
+
+      const lines: string[] = [];
+      lines.push(`Pipeline (${REPO_FOR_HOOK})`);
+      lines.push(`Status: ${status}`);
+
+      if (currentJob) {
+        const issue = state.currentIssue || "?";
+        const worker = state.currentWorker || "unknown";
+        const startedAt = state.currentJobStartedAt || state.startedAt || "?";
+        lines.push(`Active job: ${currentJob} (issue #${issue}, worker: ${worker}, started: ${startedAt})`);
+      }
+
+      if (queue.length > 0) {
+        lines.push(`Queue: ${queue.map((n: unknown) => `#${n}`).join(", ")} (${queue.length} pending)`);
+      } else {
+        lines.push("Queue: empty");
+      }
+
+      const lc = state.lastCompleted as Record<string, unknown> | undefined;
+      if (lc?.issue) {
+        lines.push(`Last completed: issue #${lc.issue} → PR #${lc.pr || "?"} (${lc.completedAt || "?"})`);
+      }
+
+      if (state.lastError) {
+        lines.push(`Last error: ${String(state.lastError).slice(0, 200)}`);
+      }
+
+      if (pendingNotifications.length > 0) {
+        lines.push("Recent events:");
+        lines.push(...pendingNotifications.splice(0));
+      }
+
+      return {
+        prependContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
+      };
+    });
+
     if (_plExists(_plGuardPath)) {
       api.logger.info("pipeline-orchestrator: skipping duplicate registration (pid-lock)");
       return;
     }
     try { _plWrite(_plGuardPath, String(Date.now())); } catch {}
 
-    const cfg = api.pluginConfig as Record<string, unknown>;
-
     const REPO = String(cfg.repo || "noncelogic/signalflow");
     const PROJECT_PATH = String(cfg.projectPath || "");
-    const STATE_PATH = String(
-      cfg.statePath ||
-        join(
-          process.env.HOME || "",
-          ".openclaw",
-          "workspace",
-          "memory",
-          "pipeline-state.json",
-        ),
-    );
+    const STATE_PATH = STATE_PATH_FOR_HOOK;
     const INTERVAL = (Number(cfg.intervalSec) || 30) * 1000;
     const NOTIFY = cfg.notifyEnabled !== false;
 
@@ -150,56 +193,6 @@ const pipelinePlugin = {
     // ========================================================================
     // Session-aware notifications
     // ========================================================================
-
-    const pendingNotifications: string[] = [];
-
-    api.on("before_agent_start", async (_event) => {
-      // Inject rich pipeline state so the agent can reason about pipeline progress
-      const state = await readStateJson(STATE_PATH);
-      const status = String(state.status || "unknown");
-      const currentJob = state.currentJob || null;
-      const queue = Array.isArray(state.queue) ? state.queue : [];
-
-      const lines: string[] = [];
-      lines.push(`Pipeline (${REPO})`);
-      lines.push(`Status: ${status}`);
-
-      // Active job details
-      if (currentJob) {
-        const issue = state.currentIssue || "?";
-        const worker = state.currentWorker || "unknown";
-        const startedAt = state.currentJobStartedAt || state.startedAt || "?";
-        lines.push(`Active job: ${currentJob} (issue #${issue}, worker: ${worker}, started: ${startedAt})`);
-      }
-
-      // Queue
-      if (queue.length > 0) {
-        lines.push(`Queue: ${queue.map((n: unknown) => `#${n}`).join(", ")} (${queue.length} pending)`);
-      } else {
-        lines.push("Queue: empty");
-      }
-
-      // Last completed job
-      const lc = state.lastCompleted as Record<string, unknown> | undefined;
-      if (lc?.issue) {
-        lines.push(`Last completed: issue #${lc.issue} → PR #${lc.pr || "?"} (${lc.completedAt || "?"})`);
-      }
-
-      // Last error
-      if (state.lastError) {
-        lines.push(`Last error: ${String(state.lastError).slice(0, 200)}`);
-      }
-
-      // Recent significant events from orchestration cycles
-      if (pendingNotifications.length > 0) {
-        lines.push("Recent events:");
-        lines.push(...pendingNotifications.splice(0));
-      }
-
-      return {
-        prependContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
-      };
-    });
 
     function queueNotification(message: string) {
       pendingNotifications.push(`[${new Date().toISOString()}] ${message}`);

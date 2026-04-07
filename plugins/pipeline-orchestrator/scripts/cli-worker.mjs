@@ -37,6 +37,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Markers that indicate the agent has finished its work (PR merged, repo cleaned up).
+// The openclaw agent --local process stays alive after completing, so we detect
+// completion from output and gracefully terminate.
+const COMPLETION_MARKERS = [
+  /PR is (?:already )?\*?\*?MERGED\*?\*?/i,
+  /Returned repo to main/i,
+  /git checkout main.*\n.*git pull --ff-only origin main/s,
+];
+const COMPLETION_GRACE_MS = Number(process.env.PIPELINE_COMPLETION_GRACE_MS || 30_000);
+
+function hasCompletionMarker(text) {
+  return COMPLETION_MARKERS.some((re) => re.test(text));
+}
+
 function isRateLimitText(text) {
   const normalized = String(text || '').toLowerCase();
   return (
@@ -111,6 +125,7 @@ async function releaseCodexLock() {
 }
 
 let shuttingDown = false;
+let completionDetected = false;
 let childProcess = null;
 let codexLockHeld = false;
 
@@ -175,6 +190,28 @@ async function run() {
     const text = data.toString();
     outputBuffer += text;
     await log(text);
+
+    // Detect when the agent has finished its work (PR merged, repo cleaned up)
+    // and schedule a graceful shutdown since --local agents don't exit on their own.
+    if (!completionDetected && hasCompletionMarker(outputBuffer)) {
+      completionDetected = true;
+      await log(`\n[worker] Completion marker detected, waiting ${COMPLETION_GRACE_MS / 1000}s before terminating agent...\n`);
+      setTimeout(async () => {
+        if (childProcess && childProcess.exitCode === null) {
+          await log(`[worker] Grace period elapsed, sending SIGTERM to agent\n`);
+          childProcess.kill('SIGTERM');
+          // Force kill after 10s if SIGTERM doesn't work — check exitCode
+          // instead of .killed since .killed is true after signal is sent,
+          // regardless of whether the process actually exited.
+          setTimeout(async () => {
+            if (childProcess && childProcess.exitCode === null) {
+              await log(`[worker] SIGTERM did not terminate agent, sending SIGKILL\n`);
+              childProcess.kill('SIGKILL');
+            }
+          }, 10_000);
+        }
+      }, COMPLETION_GRACE_MS);
+    }
   });
 
   childProcess.stderr.on('data', async (data) => {
@@ -202,7 +239,8 @@ async function run() {
     }
 
     let eventText = '';
-    if (code === 0) {
+    // Treat completion-marker-triggered termination as success regardless of exit code
+    if (code === 0 || completionDetected) {
       meta.status = 'completed';
 
       // Try to parse cost/duration from output if Claude prints it
