@@ -147,7 +147,11 @@ const pipelinePlugin = {
       }
 
       return {
-        prependContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
+        // Use prependSystemContext instead of prependContext to avoid persisting
+        // pipeline state in the session transcript. prependContext gets prepended
+        // to the user message and accumulates in history, causing session bloat.
+        // prependSystemContext goes in the system prompt and is ephemeral per-turn.
+        prependSystemContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
       };
     });
 
