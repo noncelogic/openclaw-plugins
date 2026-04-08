@@ -432,6 +432,74 @@ const pipelinePlugin = {
     );
 
     // ========================================================================
+    // Session Health Monitor
+    // ========================================================================
+
+    const SESSION_TOKEN_CEILING = Number(cfg.sessionTokenCeiling || 200_000);
+    const SESSIONS_DIR = join(process.env.HOME || "", ".openclaw", "agents", "main", "sessions");
+    const SESSIONS_STORE_PATH = join(SESSIONS_DIR, "sessions.json");
+
+    async function monitorSessionHealth() {
+      if (SESSION_TOKEN_CEILING <= 0) return;
+      try {
+        const store = JSON.parse(await readFile(SESSIONS_STORE_PATH, "utf-8"));
+        for (const [key, entry] of Object.entries(store) as [string, Record<string, unknown>][]) {
+          if (!key.includes("telegram:direct")) continue;
+          const tokens = Number(entry.contextTokens || 0);
+          if (tokens < SESSION_TOKEN_CEILING) continue;
+
+          api.logger.warn(
+            `pipeline-orchestrator: session ${key} at ${tokens} tokens (ceiling: ${SESSION_TOKEN_CEILING}), resetting`,
+          );
+
+          // Back up the transcript
+          const sessionFile = String(entry.sessionFile || entry.sessionId || "");
+          const transcriptPath = sessionFile.startsWith("/")
+            ? sessionFile
+            : join(SESSIONS_DIR, sessionFile + ".jsonl");
+          const backupPath = transcriptPath + `.bak.${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+          try {
+            await writeFile(backupPath, await readFile(transcriptPath, "utf-8"));
+          } catch {}
+
+          // Clear the transcript
+          try {
+            await writeFile(transcriptPath, "");
+          } catch {}
+
+          // Reset session entry — preserve routing info, zero tokens
+          store[key] = {
+            sessionId: entry.sessionId,
+            updatedAt: Date.now(),
+            chatType: entry.chatType,
+            deliveryContext: entry.deliveryContext,
+            lastChannel: entry.lastChannel,
+            lastTo: entry.lastTo,
+            lastAccountId: entry.lastAccountId,
+            origin: entry.origin,
+            sessionFile: entry.sessionFile,
+            compactionCount: 0,
+            contextTokens: 0,
+            totalTokens: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            status: "done",
+            model: entry.model,
+            modelProvider: entry.modelProvider,
+            channel: entry.channel,
+          };
+
+          queueNotification(`Session auto-reset: ${key} was at ${tokens} tokens (ceiling: ${SESSION_TOKEN_CEILING})`);
+        }
+        await writeFile(SESSIONS_STORE_PATH, JSON.stringify(store, null, 2));
+      } catch (err) {
+        api.logger.warn(
+          `pipeline-orchestrator: session health check failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // ========================================================================
     // Service
     // ========================================================================
 
@@ -440,7 +508,10 @@ const pipelinePlugin = {
       `pipeline-orchestrator: starting loop (interval=${INTERVAL / 1000}s, repo=${REPO})`,
     );
     setTimeout(() => orchestrate(), 5000);
-    orchestrateTimer = setInterval(() => orchestrate(), INTERVAL);
+    orchestrateTimer = setInterval(async () => {
+      await orchestrate();
+      await monitorSessionHealth();
+    }, INTERVAL);
   },
 };
 
