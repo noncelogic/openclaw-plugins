@@ -146,12 +146,26 @@ const pipelinePlugin = {
         lines.push(...pendingNotifications.splice(0));
       }
 
+      // Inject session history from previous auto-reset if available
+      const historyPath = join(
+        process.env.HOME || "", ".openclaw", "workspace", "memory", "session-history.md",
+      );
+      let sessionHistory = "";
+      try {
+        sessionHistory = require("fs").readFileSync(historyPath, "utf-8").trim();
+      } catch {}
+
+      const blocks: string[] = [`<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`];
+      if (sessionHistory) {
+        blocks.push(`<session-history>\n${sessionHistory}\n</session-history>`);
+      }
+
       return {
         // Use prependSystemContext instead of prependContext to avoid persisting
         // pipeline state in the session transcript. prependContext gets prepended
         // to the user message and accumulates in history, causing session bloat.
         // prependSystemContext goes in the system prompt and is ephemeral per-turn.
-        prependSystemContext: `<pipeline-context>\n${lines.join("\n")}\n</pipeline-context>`,
+        prependSystemContext: blocks.join("\n\n"),
       };
     });
 
@@ -438,11 +452,42 @@ const pipelinePlugin = {
     const SESSION_TOKEN_CEILING = Number(cfg.sessionTokenCeiling || 200_000);
     const SESSIONS_DIR = join(process.env.HOME || "", ".openclaw", "agents", "main", "sessions");
     const SESSIONS_STORE_PATH = join(SESSIONS_DIR, "sessions.json");
+    const SESSION_HISTORY_PATH = join(
+      process.env.HOME || "", ".openclaw", "workspace", "memory", "session-history.md",
+    );
+
+    // Extract a compact summary from the last N assistant messages in a transcript
+    function extractSessionSummary(transcriptPath: string): string {
+      try {
+        const raw = require("fs").readFileSync(transcriptPath, "utf-8");
+        const lines = raw.split("\n").filter(Boolean);
+        const assistantMessages: string[] = [];
+        for (const line of lines) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.message?.role === "assistant" && Array.isArray(entry.message.content)) {
+              for (const block of entry.message.content) {
+                if (block.type === "text" && block.text?.trim()) {
+                  assistantMessages.push(block.text.trim());
+                }
+              }
+            }
+          } catch {}
+        }
+        // Take the last 5 assistant messages as context
+        const recent = assistantMessages.slice(-5);
+        if (recent.length === 0) return "";
+        return recent.map((m, i) => `[${i + 1}] ${m.slice(0, 500)}`).join("\n\n");
+      } catch {
+        return "";
+      }
+    }
 
     async function monitorSessionHealth() {
       if (SESSION_TOKEN_CEILING <= 0) return;
       try {
         const store = JSON.parse(await readFile(SESSIONS_STORE_PATH, "utf-8"));
+        let storeChanged = false;
         for (const [key, entry] of Object.entries(store) as [string, Record<string, unknown>][]) {
           if (!key.includes("telegram:direct")) continue;
           const tokens = Number(entry.contextTokens || 0);
@@ -452,14 +497,38 @@ const pipelinePlugin = {
             `pipeline-orchestrator: session ${key} at ${tokens} tokens (ceiling: ${SESSION_TOKEN_CEILING}), resetting`,
           );
 
-          // Back up the transcript
+          // Resolve transcript path
           const sessionFile = String(entry.sessionFile || entry.sessionId || "");
           const transcriptPath = sessionFile.startsWith("/")
             ? sessionFile
             : join(SESSIONS_DIR, sessionFile + ".jsonl");
           const backupPath = transcriptPath + `.bak.${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+
+          // Extract summary before backup
+          const summary = extractSessionSummary(transcriptPath);
+
+          // Back up the transcript
           try {
             await writeFile(backupPath, await readFile(transcriptPath, "utf-8"));
+          } catch {}
+
+          // Write session history memory file — references the backup transcript
+          // and contains a compact summary for continuity
+          const historyContent = [
+            `# Session History (auto-compacted)`,
+            ``,
+            `**Reset at:** ${new Date().toISOString()}`,
+            `**Reason:** Session reached ${tokens} tokens (ceiling: ${SESSION_TOKEN_CEILING})`,
+            `**Backup transcript:** ${backupPath}`,
+            `**Session:** ${key}`,
+            ``,
+            `## Recent conversation summary`,
+            ``,
+            summary || "(no extractable summary)",
+          ].join("\n");
+          try {
+            await writeFile(SESSION_HISTORY_PATH, historyContent);
+            api.logger.info(`pipeline-orchestrator: wrote session history to ${SESSION_HISTORY_PATH}`);
           } catch {}
 
           // Clear the transcript
@@ -488,10 +557,13 @@ const pipelinePlugin = {
             modelProvider: entry.modelProvider,
             channel: entry.channel,
           };
+          storeChanged = true;
 
-          queueNotification(`Session auto-reset: ${key} was at ${tokens} tokens (ceiling: ${SESSION_TOKEN_CEILING})`);
+          queueNotification(`Session auto-reset: ${key} was at ${tokens} tokens — summary saved to session-history.md`);
         }
-        await writeFile(SESSIONS_STORE_PATH, JSON.stringify(store, null, 2));
+        if (storeChanged) {
+          await writeFile(SESSIONS_STORE_PATH, JSON.stringify(store, null, 2));
+        }
       } catch (err) {
         api.logger.warn(
           `pipeline-orchestrator: session health check failed: ${err instanceof Error ? err.message : String(err)}`,
