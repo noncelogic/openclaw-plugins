@@ -655,10 +655,43 @@ async function run() {
         out.transitions.push(`pr-pending -> idle (detected already-merged PR #${mergedMatch.number})`);
         out.changed = true;
       } else {
-        setIdle(next);
-        next.lastError = `pr-pending without matching open PR for issue ${targetIssue ?? 'unknown'} at ${nowIso}`;
-        out.transitions.push('pr-pending -> idle (missing open PR)');
-        out.changed = true;
+        // No open or merged PR found. Check if the branch exists with commits
+        // ahead of main — if so, the agent completed work but failed to create
+        // the PR (common during GitHub rate limiting). Create it now.
+        const branch = next.currentBranch || (targetIssue ? `issue-${targetIssue}` : null);
+        let recovered = false;
+        if (branch) {
+          const diff = await runProc(
+            'gh', ['api', `repos/${PIPELINE_REPO}/compare/main...${branch}`, '--jq', '.ahead_by // 0'],
+            { cwd: PIPELINE_PROJECT_PATH },
+          );
+          const aheadBy = Number(String(diff.stdout).trim());
+          if (diff.code === 0 && aheadBy > 0) {
+            const title = targetIssue
+              ? `fix: automated PR for issue #${targetIssue} (fixes #${targetIssue})`
+              : `fix: automated PR from branch ${branch}`;
+            const create = await runProc(
+              'gh',
+              ['pr', 'create', '--repo', PIPELINE_REPO, '--head', branch, '--base', 'main',
+               '--title', title, '--body', `Closes #${targetIssue || ''}\n\nAutomated PR created by pipeline orchestrator (branch had ${aheadBy} commit(s) ahead of main but no PR).`],
+              { cwd: PIPELINE_PROJECT_PATH },
+            );
+            if (create.code === 0) {
+              const prUrl = String(create.stdout).trim();
+              const prNum = Number(String(prUrl).match(/\/(\d+)$/)?.[1] || 0);
+              next.lastError = null;
+              out.transitions.push(`pr-pending -> pr-pending (auto-created PR #${prNum || prUrl} for ${branch})`);
+              out.changed = true;
+              recovered = true;
+            }
+          }
+        }
+        if (!recovered) {
+          setIdle(next);
+          next.lastError = `pr-pending without matching open PR for issue ${targetIssue ?? 'unknown'} at ${nowIso}`;
+          out.transitions.push('pr-pending -> idle (missing open PR)');
+          out.changed = true;
+        }
       }
     } else {
       // Policy: never direct-merge from orchestrator.

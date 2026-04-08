@@ -43,7 +43,13 @@ function sleep(ms) {
 const COMPLETION_MARKERS = [
   /PR is (?:already )?\*?\*?MERGED\*?\*?/i,
   /Returned repo to main/i,
+  /Returned to.*main/i,
   /git checkout main.*\n.*git pull --ff-only origin main/s,
+  /Final repo state/i,
+  /Process cleanup/i,
+  /could\s+\*?\*?not\*?\*?\s+open the PR/i,
+  /Resource not accessible by personal access token/i,
+  /No (?:background |long-running )?processes? left running/i,
 ];
 const COMPLETION_GRACE_MS = Number(process.env.PIPELINE_COMPLETION_GRACE_MS || 30_000);
 
