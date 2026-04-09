@@ -285,6 +285,12 @@ async function run() {
     if (eventText) {
       await emitSystemEvent(eventText);
     }
+
+    // Exit the worker process explicitly. Without this, the Node event loop
+    // stays alive due to lingering timers (completion detection setTimeout)
+    // and the worker becomes a zombie that the orchestrator can't reap.
+    await log(`[worker] Job ${jobId} finished (${meta.status}), exiting worker\n`);
+    process.exit(code === 0 || completionDetected ? 0 : 1);
   });
 }
 
