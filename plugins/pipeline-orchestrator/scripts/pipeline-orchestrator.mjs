@@ -15,7 +15,7 @@ const PIPELINE_REPO = process.env.PIPELINE_REPO || 'noncelogic/cortex-plane';
 const PIPELINE_PROJECT_PATH = process.env.PIPELINE_PROJECT_PATH || join(WORKSPACE_DIR, 'projects', 'cortex-plane');
 const MAX_WIP = Number(process.env.PIPELINE_MAX_WIP || 1);
 const CLAUDE_MODEL = process.env.PIPELINE_CLAUDE_MODEL || '';
-const CODEX_MODEL = process.env.PIPELINE_CODEX_MODEL || 'gpt-5.3-codex';
+const CODEX_MODEL = process.env.PIPELINE_CODEX_MODEL || 'gpt-5.4';
 const COOLDOWN_MINUTES = Number(process.env.PIPELINE_CLAUDE_COOLDOWN_MINUTES || 120);
 const DEFAULT_WORKER = ['claude', 'codex'].includes(String(process.env.PIPELINE_DEFAULT_WORKER || '').toLowerCase())
   ? String(process.env.PIPELINE_DEFAULT_WORKER || '').toLowerCase()
